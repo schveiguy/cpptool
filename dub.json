@@ -1,0 +1,14 @@
+{
+	"authors": [
+		"Steven Schveighoffer"
+	],
+	"copyright": "Copyright © 2023, Steven Schveighoffer",
+	"dependencies": {
+		"io": "~>0.3.4",
+		"iopipe": "~>0.2.4",
+                "getopt2": "~>0.0.1"
+	},
+	"description": "A C preprocessor tool to help convert C to D code",
+	"license": "Boost-1.0",
+	"name": "cpptool"
+}
