@@ -268,10 +268,11 @@ int main(string[] args)
             case preprocess:
                 size_t codeID = 0;
                 outfile.writef("//CPPTOOL %s\n", outfilename);
+                bool inComment = false;
                 while(!lines.window.empty)
                 {
                     // process the next line
-                    if(lines.window.front.strip.startsWith("#"))
+                    if(!inComment && lines.window.front.strip.startsWith("#"))
                     {
                         // search for the end of the segment
                         while(lines.window.back.endsWith("\\\n"))
@@ -308,6 +309,7 @@ int main(string[] args)
                     else
                     {
                         // not a preprocessor directive, just copy it
+                        inComment = processInComment(lines.window.front, inComment);
                         outfile.write(lines.window.front);
                         lines.release(1);
                         lines.extend(0); // next line
