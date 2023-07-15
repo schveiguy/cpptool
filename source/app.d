@@ -9,6 +9,9 @@ import std.path : extension;
 import std.exception;
 import std.conv;
 import std.algorithm;
+import std.experimental.allocator.mallocator;
+
+enum symbolPostfix = "_CPPTOOL_KEEP";
 
 // an iopipe of segments based on an internal pipe. Each "element" in this pipe is a segment of the underlying source, 
 struct SegmentedPipe(SourceChain, Allocator = GCNoPointerAllocator)
@@ -125,21 +128,18 @@ struct Writer(Chain)
 {
     Chain chain;
     alias Char = ElementEncodingType!(WindowType!Chain);
+    private AllocatedBuffer!(Char, Mallocator, 256) writeBuffer; // holds the data to be written, which must be parsed
+    string[] keepSymbols; // holds macro identifiers that should be preserved
+    bool recoverMode;
     void put(scope const(Char)[] data)
     {
-        while(data.length > 0)
-        {
-            if(!chain.window.length)
-            {
-                if(chain.extend(0) == 0)
-                    assert(false, "Could not get more space to write data!");
-            }
-            import std.algorithm : min;
-            immutable elems = min(data.length, chain.window.length);
-            chain.window[0 .. elems] = data[0 .. elems];
-            data = data[elems .. $];
-            chain.release(elems); // lock in data to the write pipe
-        }
+        // We aren't going to release it, just build up enough space.
+        immutable pos = writeBuffer.window.length;
+        immutable need = pos + data.length;
+        while(writeBuffer.window.length < need)
+            enforce(writeBuffer.extend(need - writeBuffer.window.length) != 0);
+        writeBuffer.window[pos .. pos + data.length] = data;
+        writeBuffer.releaseBack(writeBuffer.window.length - need); // give excess back to the buffer
     }
 
     void write(Args...)(Args args)
@@ -150,12 +150,110 @@ struct Writer(Chain)
         {
             formattedWrite(this, "%s", arg);
         }
+        releaseToOutput();
     }
 
     void writef(Args...)(string formatStr, Args args)
     {
         import std.format;
         formattedWrite(this, formatStr, args);
+        releaseToOutput();
+    }
+
+    private void releaseToOutput()
+    {
+        while(writeBuffer.window.length > 0)
+        {
+            if(recoverMode)
+            {
+                // doesn't matter where it is, substitute the keep string for blank
+                foreach(t; writeBuffer.window.splitter(symbolPostfix))
+                {
+                    while(t.length > 0)
+                    {
+                        if(chain.window.length == 0 && chain.extend(0) == 0)
+                            assert(false, "Could not get more buffer data!");
+                        immutable elems = min(chain.window.length, t.length);
+                        chain.window[0 .. elems] = t[0 .. elems];
+                        chain.release(elems);
+                        t = t[elems .. $];
+                    }
+                }
+                writeBuffer.releaseFront(writeBuffer.window.length);
+            }
+            else
+            {
+                size_t nToCopy = writeBuffer.window.length;
+                string key = null;
+                // check for a line that starts with #include. Those lines, we just ignore for replacements.
+                if(!writeBuffer.window.strip.startsWith("#include"))
+                {
+                    foreach(k; keepSymbols)
+                    {
+                        import std.ascii; // c identifiers are in ASCII
+                                          // if we can find the key in the input
+                        auto searchwin = writeBuffer.window[0 .. nToCopy];
+                        bool ident = false;
+                        size_t matched;
+                        size_t pos = searchwin.length;
+                        foreach(i, c; searchwin)
+                        {
+                            if(isAlpha(c) || c == '_' || (ident && c >= '0' && c <= '9'))
+                            {
+                                ident = true;
+                                if(matched != size_t.max && matched < k.length && k[matched] == c)
+                                    ++matched;
+                                else
+                                    matched = size_t.max;
+                            }
+                            else if(matched == k.length)
+                            {
+                                // found the match
+                                pos = i;
+                                break;
+                            }
+                            else
+                            {
+                                ident = false;
+                                matched = 0;
+                            }
+                        }
+
+                        if(matched == k.length)
+                        {
+                            // matched. pos is set to character *after* the match.
+                            key = k;
+                            nToCopy = pos;
+                        }
+                    }
+                }
+
+                while(nToCopy > 0)
+                {
+                    if(!chain.window.length)
+                    {
+                        if(chain.extend(0) == 0)
+                            assert(false, "Could not get more space to write data!");
+                    }
+                    import std.algorithm : min;
+                    immutable elems = min(nToCopy, chain.window.length);
+                    chain.window[0 .. elems] = writeBuffer.window[0 .. elems];
+                    writeBuffer.releaseFront(elems);
+                    nToCopy -= elems;
+                    chain.release(elems);
+                }
+
+                if(key.length > 0)
+                {
+                    // we found a key that was output, output also the postfix
+                    while(chain.window.length < symbolPostfix.length)
+                        if(chain.extend(0) == 0)
+                            assert(false, "could not get more space to write data!");
+                    chain.window[0 .. symbolPostfix.length] = symbolPostfix;
+                    chain.release(symbolPostfix.length);
+                }
+            }
+        }
     }
 }
 
@@ -217,6 +315,9 @@ int main(string[] args)
 
         @description("Overwrite original files after preprocessing")
         bool overwrite = false;
+
+        @description("List of identifiers that should be left alone instead of replaced")
+        string[] ignored;
     }
 
     Opts opts;
@@ -268,6 +369,7 @@ int main(string[] args)
             case preprocess:
                 size_t codeID = 0;
                 outfile.writef("//CPPTOOL %s\n", outfilename);
+                outfile.keepSymbols = opts.ignored;
                 bool inComment = false;
                 while(!lines.window.empty)
                 {
@@ -317,6 +419,7 @@ int main(string[] args)
                 }
                 break;
             case recover:
+                outfile.recoverMode = true;
                 // first, find the line that starts with `//CPPTOOL`
                 while(lines.window.length > 0)
                 {
@@ -339,7 +442,7 @@ int main(string[] args)
                 lines.release(1);
 
                 // run the state machine
-                bool inFile = false;
+                bool inFile = true;
                 bool inComment = false;  // true if /* has beeen detected
                 size_t lastWrittenCodeID = size_t.max;
                 while(lines.extend(0) != 0)
